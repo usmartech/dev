@@ -2,7 +2,7 @@ import { authDb } from '../database/auth.db';
 import { systemDb } from '../database/system.db';
 import { User, UserRole, Invite } from '../types';
 import { UserDomain } from '../domain/user.domain';
-import { validatePassword } from '../validation';
+import { validatePassword, normalizeEmail } from '../validation';
 import { serverSessionCache } from '../auth/server-session';
 import { UserMapper } from '../mappers';
 import { rbac } from '../auth/rbac';
@@ -183,32 +183,73 @@ export class AuthService {
       }
     }
 
-    const hashedPassword = await hashPassword(data.password);
-    const { data: userData, error } = await authDb.register({
-      full_name: data.full_name,
-      email: data.email,
-      password: hashedPassword,
-      phone: data.phone,
-      role: data.role,
-      active: true
-    });
-
-    if (error) throw new BadRequestError(`Signup failed in database: ${error.message || 'Unknown error'}`);
-
-    const newUser = userData as User;
-
+    let isConsumed = false;
     if (inviteId) {
-      await authDb.markInviteAsUsed(inviteId);
+      const invite = await authDb.findInviteById(inviteId);
+      if (!invite) {
+        throw new NotFoundError('Invitation not found.');
+      }
+
+      if (invite.used_at) {
+        throw new BadRequestError('Invitation has already been used.');
+      }
+
+      if (new Date(invite.expires_at) < new Date()) {
+        throw new BadRequestError('Invitation has expired.');
+      }
+
+      if (data.role !== invite.role) {
+        throw new BadRequestError('Role does not match invitation details.');
+      }
+
+      if (invite.type === 'email_bound') {
+        if (!invite.email) {
+          throw new BadRequestError('Invitation bounds are invalid.');
+        }
+        if (normalizeEmail(data.email) !== normalizeEmail(invite.email)) {
+          throw new BadRequestError('Email address does not match invitation bounds.');
+        }
+      }
+
+      // Execute atomic consumption to prevent concurrency issues
+      isConsumed = await authDb.consumeInvite(inviteId);
+      if (!isConsumed) {
+        throw new ConflictError('Invitation has already been consumed or is no longer valid.');
+      }
     }
 
-    // Explicitly create session and get token
-    const token = await this.createSession(newUser.id);
+    try {
+      const hashedPassword = await hashPassword(data.password);
+      const { data: userData, error } = await authDb.register({
+        full_name: data.full_name,
+        email: data.email,
+        password: hashedPassword,
+        phone: data.phone,
+        role: data.role,
+        active: true
+      });
 
-    return {
-        success: true,
-        user: newUser,
-        session_id: token
-    };
+      if (error) {
+        throw new BadRequestError(`Signup failed in database: ${error.message || 'Unknown error'}`);
+      }
+
+      const newUser = userData as User;
+
+      // Explicitly create session and get token
+      const token = await this.createSession(newUser.id);
+
+      return {
+          success: true,
+          user: newUser,
+          session_id: token
+      };
+    } catch (signupError) {
+      // Revert atomic consumption if registration fails
+      if (inviteId && isConsumed) {
+        await authDb.unconsumeInvite(inviteId).catch(console.error);
+      }
+      throw signupError;
+    }
   }
 
   async generateInvite(currentUser: User, role: UserRole, email?: string): Promise<{ token: string; link: string }> {
