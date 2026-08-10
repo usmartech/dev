@@ -135,5 +135,43 @@ export const authDb = {
       .eq('id', id);
 
     if (error) dbUtils.handleError(error);
+  },
+
+  async findInviteById(id: string): Promise<Invite | null> {
+    const client = adminClient || supabase;
+    const { data, error } = await client
+      .from('invites')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (error) {
+      if (error.code === 'PGRST116') return null;
+      dbUtils.handleError(error);
+    }
+    return data as Invite;
+  },
+
+  async consumeInvite(id: string): Promise<boolean> {
+    const client = adminClient || supabase;
+    const { data, error } = await client
+      .from('invites')
+      .update({ used_at: new Date().toISOString() })
+      .eq('id', id)
+      .is('used_at', null)
+      .select('id');
+
+    if (error) dbUtils.handleError(error);
+    return !!data && data.length > 0;
+  },
+
+  async unconsumeInvite(id: string): Promise<void> {
+    const client = adminClient || supabase;
+    const { error } = await client
+      .from('invites')
+      .update({ used_at: null })
+      .eq('id', id);
+
+    if (error) dbUtils.handleError(error);
   }
 };
