@@ -274,7 +274,7 @@ export class AuthService {
         expires_at: expiresAt
     });
 
-    const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://kajas.vercel.app';
+    const baseUrl = process.env.NEXT_PUBLIC_APP_URL;
     const link = `${baseUrl}/api/v1/auth/invite/accept?token=${rawToken}`;
 
     return { token: rawToken, link };
