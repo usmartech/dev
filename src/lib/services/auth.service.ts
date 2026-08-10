@@ -2,7 +2,7 @@ import { authDb } from '../database/auth.db';
 import { systemDb } from '../database/system.db';
 import { User, UserRole, Invite } from '../types';
 import { UserDomain } from '../domain/user.domain';
-import { validatePassword } from '../validation';
+import { validatePassword, validateEmail, normalizeEmail } from '../validation';
 import { serverSessionCache } from '../auth/server-session';
 import { UserMapper } from '../mappers';
 import { rbac } from '../auth/rbac';
@@ -183,32 +183,72 @@ export class AuthService {
       }
     }
 
-    const hashedPassword = await hashPassword(data.password);
-    const { data: userData, error } = await authDb.register({
-      full_name: data.full_name,
-      email: data.email,
-      password: hashedPassword,
-      phone: data.phone,
-      role: data.role,
-      active: true
-    });
-
-    if (error) throw new BadRequestError(`Signup failed in database: ${error.message || 'Unknown error'}`);
-
-    const newUser = userData as User;
-
+    // Authoritative DB validation of invitation state if inviteId is supplied
+    let inviteToUse: Invite | null = null;
     if (inviteId) {
-      await authDb.markInviteAsUsed(inviteId);
+      inviteToUse = await authDb.findInviteById(inviteId);
+      if (!inviteToUse) {
+        throw new BadRequestError('Invalid invite token');
+      }
+
+      if (inviteToUse.used_at) {
+        throw new BadRequestError('Invite has already been used');
+      }
+
+      if (new Date(inviteToUse.expires_at) < new Date()) {
+        throw new BadRequestError('Invite has expired');
+      }
+
+      if (inviteToUse.role !== data.role) {
+        throw new BadRequestError(`This invite is only valid for the role: ${inviteToUse.role}`);
+      }
+
+      if (inviteToUse.type === 'email_bound') {
+        if (!inviteToUse.email) {
+          throw new BadRequestError('Invalid email-bound invite state');
+        }
+        if (normalizeEmail(inviteToUse.email) !== normalizeEmail(data.email)) {
+          throw new BadRequestError(`This invite is bound to the email address: ${inviteToUse.email}`);
+        }
+      }
+
+      // Atomic consumption of invite *before* registration
+      const consumed = await authDb.consumeInvite(inviteId);
+      if (!consumed) {
+        throw new BadRequestError('Invite has already been used or is invalid');
+      }
     }
 
-    // Explicitly create session and get token
-    const token = await this.createSession(newUser.id);
+    try {
+      const hashedPassword = await hashPassword(data.password);
+      const { data: userData, error } = await authDb.register({
+        full_name: data.full_name,
+        email: data.email,
+        password: hashedPassword,
+        phone: data.phone,
+        role: data.role,
+        active: true
+      });
 
-    return {
-        success: true,
-        user: newUser,
-        session_id: token
-    };
+      if (error) throw new BadRequestError(`Signup failed in database: ${error.message || 'Unknown error'}`);
+
+      const newUser = userData as User;
+
+      // Explicitly create session and get token
+      const token = await this.createSession(newUser.id);
+
+      return {
+          success: true,
+          user: newUser,
+          session_id: token
+      };
+    } catch (err) {
+      // Revert/rollback invite consumption if registration failed
+      if (inviteId) {
+        await authDb.unconsumeInvite(inviteId);
+      }
+      throw err;
+    }
   }
 
   async generateInvite(currentUser: User, role: UserRole, email?: string): Promise<{ token: string; link: string }> {
@@ -220,13 +260,22 @@ export class AuthService {
         throw new BadRequestError('Email is required for admin and teacher invites');
     }
 
+    let normalizedEmail: string | undefined;
+    if (email) {
+        const emailValidation = validateEmail(email);
+        if (!emailValidation.isValid) {
+            throw new BadRequestError(emailValidation.errors[0].message);
+        }
+        normalizedEmail = normalizeEmail(email);
+    }
+
     const rawToken = generateToken();
     const tokenHash = await hashToken(rawToken);
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
 
     await authDb.createInvite({
         token_hash: tokenHash,
-        email: email || undefined,
+        email: normalizedEmail,
         role,
         type: (role === 'admin' || role === 'teacher') ? 'email_bound' : 'role_only',
         created_by: currentUser.id,
